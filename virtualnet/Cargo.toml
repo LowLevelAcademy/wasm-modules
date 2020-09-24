@@ -8,10 +8,5 @@ license = "MIT OR Apache-2.0"
 [lib]
 crate-type = ["cdylib"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[feature]
-log = {}
-
 [dependencies]
-smoltcp = { path = "/home/nikita/dev/smoltcp", default-features = false, features = [ "std", "socket-udp", "proto-ipv4", "ethernet" ] }
+smoltcp = { git = "https://github.com/nbaksalyar/smoltcp.git", branch = "lowlvl", default-features = false, features = [ "std", "socket-udp", "proto-ipv4", "ethernet" ] }
