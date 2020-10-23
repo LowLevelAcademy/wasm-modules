@@ -36,6 +36,12 @@ fn log(s: &str) {
     }
 }
 
+// List of lessons with different behaviours.
+enum Lesson {
+    ExchangingMessages,
+    Fragmentation,
+}
+
 /// This struct holds the entire state of the virtual network, including sockets, interfaces, etc.
 pub struct NetworkState<'a> {
     /// Ethernet interface for the virtual network with the WebAssembly middleware.
@@ -44,7 +50,7 @@ pub struct NetworkState<'a> {
     /// Socket set that holds all sockets used in the virtual network.
     socket_set: SocketSet<'a, 'a, 'a>,
     /// Socket for the name server.
-    dns_socket: SocketHandle,
+    dns_socket: Option<SocketHandle>,
     /// If this server runs in a 'mock' DNS mode, it will not return 'real' IP addresses
     /// used in the virtual network, but rather a hash converted into a mock IP address.
     is_mock_dns: bool,
@@ -52,6 +58,8 @@ pub struct NetworkState<'a> {
     alice_socket: Option<SocketHandle>,
     /// Socket for the easter egg server. ;)
     easter_socket: Option<SocketHandle>,
+    /// Lesson ID
+    lesson: Lesson,
 }
 
 // There's only one thread in the wasm runtime, so we use thread_locals for global state storage.
@@ -95,12 +103,23 @@ fn setup_dns_socket(socket_set: &mut SocketSet) -> SocketHandle {
     socket_set.add(socket)
 }
 
-/// Setup UDP sockets for Alice & the easter egg server.
-fn setup_alice_socket(socket_set: &mut SocketSet) -> (Option<SocketHandle>, Option<SocketHandle>) {
-    // Alice
+/// Setup UDP socket for Alice.
+fn setup_alice_socket(socket_set: &mut SocketSet, net_buffer_size: usize) -> Option<SocketHandle> {
     let mut socket = {
-        let udp_rx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 4], vec![0; 1024]);
-        let udp_tx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 4], vec![0; 1024]);
+        let udp_rx_buffer = UdpSocketBuffer::new(
+            vec![
+                UdpPacketMetadata::EMPTY;
+                net_buffer_size / std::mem::size_of::<UdpPacketMetadata>()
+            ],
+            vec![0; net_buffer_size],
+        );
+        let udp_tx_buffer = UdpSocketBuffer::new(
+            vec![
+                UdpPacketMetadata::EMPTY;
+                net_buffer_size / std::mem::size_of::<UdpPacketMetadata>()
+            ],
+            vec![0; net_buffer_size],
+        );
         UdpSocket::new(udp_rx_buffer, udp_tx_buffer)
     };
     socket
@@ -109,7 +128,11 @@ fn setup_alice_socket(socket_set: &mut SocketSet) -> (Option<SocketHandle>, Opti
 
     let alice_socket = socket_set.add(socket);
 
-    // Easter egg
+    return Some(alice_socket);
+}
+
+/// Setup UDP socket for the easter egg server.
+fn setup_easter_egg_socket(socket_set: &mut SocketSet) -> Option<SocketHandle> {
     let mut socket = {
         let udp_rx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 4], vec![0; 1024]);
         let udp_tx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 4], vec![0; 1024]);
@@ -121,12 +144,12 @@ fn setup_alice_socket(socket_set: &mut SocketSet) -> (Option<SocketHandle>, Opti
 
     let easter_egg_socket = socket_set.add(socket);
 
-    return (Some(alice_socket), Some(easter_egg_socket));
+    return Some(easter_egg_socket);
 }
 
 /// Handle DNS requests.
-fn poll_dns(network: &mut NetworkState) {
-    let mut dns_sock = network.socket_set.get::<UdpSocket>(network.dns_socket);
+fn poll_dns(socket: SocketHandle, network: &mut NetworkState) {
+    let mut dns_sock = network.socket_set.get::<UdpSocket>(socket);
 
     match dns_sock.recv() {
         Ok((data, sender_endpoint)) => {
@@ -184,10 +207,13 @@ fn poll_alice(network: &mut NetworkState) {
 
     match sock.recv() {
         Ok((_, sender_endpoint)) => {
-            unsafe { test_completed(TEST_CONTACTED_ALICE) };
+            // Send a response, but only for the 1st lesson.
+            if let Lesson::ExchangingMessages = network.lesson {
+                unsafe { test_completed(TEST_CONTACTED_ALICE) };
 
-            sock.send_slice(b"Hello from Alice!", sender_endpoint)
-                .unwrap(); // fixme: properly report errors
+                sock.send_slice(b"Hello from Alice!", sender_endpoint)
+                    .unwrap(); // fixme: properly report errors
+            }
         }
         Err(smoltcp::Error::Exhausted) => {
             // buffer is empty, ignore
@@ -227,10 +253,15 @@ fn poll_easter(network: &mut NetworkState) {
 }
 
 fn poll_services(network: &mut NetworkState) {
-    poll_dns(network);
+    if let Some(socket) = network.dns_socket {
+        poll_dns(socket, network);
+    }
 
-    if !network.is_mock_dns {
+    if network.alice_socket.is_some() {
         poll_alice(network);
+    }
+
+    if network.easter_socket.is_some() {
         poll_easter(network);
     }
 }
@@ -239,13 +270,12 @@ fn poll_services(network: &mut NetworkState) {
 /// If `mock_dns` is true, only a 'fake' name server will be initialised.
 /// The fake name server will return IP addresses that don't exist in the virtual network.
 #[no_mangle]
-pub fn setup_network(mock_dns: bool) {
+pub fn setup_network(is_mock_dns: bool) {
     let clock = mock::Clock::new();
 
     let loopback = Loopback::new();
     let device = WasmMiddleware::new(loopback);
 
-    // let neighbor_cache = unsafe { NeighborCache::new(&mut NEIGHBOR_CACHE[..]) };
     let neighbor_cache = NeighborCache::new(BTreeMap::new());
 
     let iface = EthernetInterfaceBuilder::new(device)
@@ -261,12 +291,14 @@ pub fn setup_network(mock_dns: bool) {
 
     let mut socket_set = SocketSet::new(vec![]);
 
-    let dns_socket = setup_dns_socket(&mut socket_set);
+    let dns_socket = Some(setup_dns_socket(&mut socket_set));
 
-    let (alice_socket, easter_socket) = if mock_dns {
+    let (alice_socket, easter_socket) = if is_mock_dns {
         (None, None)
     } else {
-        setup_alice_socket(&mut socket_set)
+        let alice = setup_alice_socket(&mut socket_set, 1024);
+        let easter = setup_easter_egg_socket(&mut socket_set);
+        (alice, easter)
     };
 
     let network = NetworkState {
@@ -276,7 +308,48 @@ pub fn setup_network(mock_dns: bool) {
         dns_socket,
         alice_socket,
         easter_socket,
-        is_mock_dns: mock_dns,
+        is_mock_dns,
+        lesson: Lesson::ExchangingMessages,
+    };
+
+    NETWORK.with(|net| {
+        *net.borrow_mut() = Some(network);
+    });
+}
+
+/// Initialise the virtual network, setup sockets, etc.
+/// This function is used for the 2nd lesson in the 'TCP/IP Fundamentals' series.
+#[no_mangle]
+pub fn setup_fragmentation_network() {
+    let clock = mock::Clock::new();
+
+    let loopback = Loopback::new();
+    let device = WasmMiddleware::new(loopback);
+
+    let neighbor_cache = NeighborCache::new(BTreeMap::new());
+
+    let iface = EthernetInterfaceBuilder::new(device)
+        .ethernet_addr(EthernetAddress::default())
+        .neighbor_cache(neighbor_cache)
+        .ip_addrs([
+            IpCidr::new(IpAddress::v4(10, 0, 0, 1), 8),  // User's IP
+            IpCidr::new(IpAddress::v4(10, 0, 0, 42), 8), // Alice
+        ])
+        .finalize();
+
+    let mut socket_set = SocketSet::new(vec![]);
+
+    let alice_socket = setup_alice_socket(&mut socket_set, 65536 * 4);
+
+    let network = NetworkState {
+        iface,
+        clock,
+        socket_set,
+        dns_socket: None,
+        alice_socket,
+        easter_socket: None,
+        is_mock_dns: false,
+        lesson: Lesson::Fragmentation,
     };
 
     NETWORK.with(|net| {
@@ -325,9 +398,10 @@ pub unsafe fn poll_network() {
 #[no_mangle]
 pub unsafe fn udp_bind(ip: u32, port: u16) -> usize {
     let mut socket = {
-        let udp_rx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 4], vec![0; 1024]);
-        let udp_tx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 4], vec![0; 1024]);
-
+        let udp_rx_buffer =
+            UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 128], vec![0; 65536]);
+        let udp_tx_buffer =
+            UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY; 128], vec![0; 65536 * 4]);
         UdpSocket::new(udp_rx_buffer, udp_tx_buffer)
     };
 
@@ -367,11 +441,13 @@ pub unsafe fn udp_send_to(sock: usize, buf: *const u8, buf_len: u16, dst_ip: u32
         let endpoint =
             IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(dst_ip.to_be_bytes())), dst_port);
         let buf_slice = slice::from_raw_parts(buf, buf_len as usize);
-        log(&format!("({:?}) {:?} -> {:?}", sock, buf_slice, endpoint));
 
         let res = socket.send_slice(buf_slice, endpoint);
 
-        log(&format!("{:?}", res));
+        log(&format!(
+            "udp_send_to (sock {:?}), sending {:?} bytes to {:?}, res: {:?}",
+            sock, buf_len, endpoint, res
+        ));
     })
 }
 
